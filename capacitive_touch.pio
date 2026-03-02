@@ -1,0 +1,76 @@
+;
+; Capacitive Touch Sensing PIO Program for RP2040
+;
+; This program measures the charging time of a capacitive touch sensor
+; by pulling the pin low briefly, then switching to input and counting
+; cycles until the pin reads high (charged by the pull-up resistor).
+;
+; When a finger touches the electrode, capacitance increases, which
+; increases the charging time and thus the cycle count.
+;
+; Clock divider should be set to achieve ~1 MHz (1 cycle = 1 us)
+; For 125 MHz system clock, use divider of 125
+;
+
+.program capacitive_touch
+
+.wrap_target
+    ; Pull the pin low to discharge the capacitor, then wait 10 us
+    set pindirs, 1          ; Set pin to output mode
+    set pins, 0 [9]         ; Drive pin low and delay 9 cycles (total 10 us)
+    
+    ; Now switch pin to input mode and count cycles until it reads high
+    set pindirs, 0          ; Set pin to input mode
+    set pins, 1             ; Set output register to 1 (for proper high-Z behavior)
+    
+    ; Initialize counter - start at max and count down
+    ; CPU will calculate: actual_count = 0xFFFFFFFF - reading
+    mov x, ~NULL            ; x = 0xFFFFFFFF
+    
+count_loop:
+    jmp x-- test_pin        ; Decrement x, then jump (always taken first time)
+test_pin:
+    jmp pin count_done      ; If pin is high, we're done counting
+    jmp count_loop          ; Otherwise continue counting
+
+count_done:
+    ; Push the count to the FIFO
+    mov isr, x              ; Move remaining count to ISR
+    push noblock            ; Push to FIFO (noblock to avoid stalling)
+    
+    ; Leave pin in high-Z / input mode (already set)
+    ; The pin will remain in input mode, ready for next cycle
+    
+.wrap                       ; Loop back to start
+
+% c-sdk {
+static inline void capacitive_touch_program_init(PIO pio, uint sm, uint offset, uint pin) {
+    // Get default state machine config
+    pio_sm_config c = capacitive_touch_program_get_default_config(offset);
+    
+    // Configure the pin for SET operations
+    sm_config_set_set_pins(&c, pin, 1);
+    
+    // Configure the pin for JMP PIN test
+    sm_config_set_jmp_pin(&c, pin);
+    
+    // Set clock divider to ~1 MHz (125 MHz / 125 = 1 MHz)
+    // This makes each PIO cycle = 1 microsecond
+    sm_config_set_clkdiv(&c, 125.0f);
+    
+    // Configure autopush: we're using manual push, so disable autopush
+    sm_config_set_in_shift(&c, false, false, 32);
+    sm_config_set_out_shift(&c, false, false, 32);
+    
+    // Disable internal pulls BEFORE initializing PIO control - we have an external pull-up
+    gpio_set_pulls(pin, false, false);
+    
+    // Set the pin to input mode initially (high-Z) and give control to PIO
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
+    
+    // Initialize and start the state machine
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
