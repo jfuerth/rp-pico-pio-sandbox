@@ -100,7 +100,8 @@ int main() {
             // Read the cycle count from FIFO
             // PIO counts DOWN from 0xFFFFFFFF, so actual count = MAX - reading
             uint32_t countdown_value = pio_sm_get_blocking(pio, sm);
-            readings[i] = 0xFFFFFFFF - countdown_value;
+            // readings[i] = 0xFFFFFFFF - countdown_value;
+            readings[i] = countdown_value;
         }
         
         // Print all readings on one line

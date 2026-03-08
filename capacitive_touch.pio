@@ -1,9 +1,9 @@
 ;
-; Capacitive Touch Sensing PIO Program for RP2040
+; ## Capacitive Touch Sensing PIO Program for RP2040
 ;
 ; This program measures the charging time of a capacitive touch sensor
 ; by pulling the pin low briefly, then switching to input and counting
-; cycles until the pin reads high (charged by the pull-up resistor).
+; cycles until the pin reads high (charged by an external pull-up resistor).
 ;
 ; When a finger touches the electrode, capacitance increases, which
 ; increases the charging time and thus the cycle count.
@@ -11,37 +11,38 @@
 ; Clock divider should be set to achieve ~1 MHz (1 cycle = 1 us)
 ; For 125 MHz system clock, use divider of 125
 ;
+; ## Scanning multiple keys in sequence
+;
+; We need to scan the keys one at a time, because the readings really affect each
+; other when multiple keys are pressed. It's possible that scanning all keys at once
+; would actually work (because they'd all be in high-impedance mode together) but I
+; haven't tried it because we wouldn't be able to track a count for when each key
+; transitioned from low to high. We could stop when they are all high, but we want
+; separate readings per key.
+;
+; This program maintains a "one hot" bitmask in the OSR, which says which pin
+; to drive. The OSR is otherwise unused since this is an input-only program. We use
+; the bit shifting capability of the IN instruction to shift it along once per scanning cycle.
+;
 
 .program capacitive_touch
 
-.wrap_target
-    ; Pull the pin low to discharge the capacitor, then wait 10 us
-    set pindirs, 1          ; Set pin to output mode
-    set pins, 0 [9]         ; Drive pin low and delay 9 cycles (total 10 us)
-    
-    ; Now switch pin to input mode and count cycles until it reads high
-    set pindirs, 0          ; Set pin to input mode
-    set pins, 1             ; Set output register to 1 (for proper high-Z behavior)
-    
-    ; Initialize counter - start at max and count down
-    ; CPU will calculate: actual_count = 0xFFFFFFFF - reading
-    mov x, ~NULL            ; x = 0xFFFFFFFF
-    
-count_loop:
-    jmp x-- test_pin        ; Decrement x, then jump (always taken first time)
-test_pin:
-    jmp pin count_done      ; If pin is high, we're done counting
-    jmp count_loop          ; Otherwise continue counting
+; seed the OSR with a 1
+setup:
+set y, 1
+mov osr, y
 
-count_done:
-    ; Push the count to the FIFO
-    mov isr, x              ; Move remaining count to ISR
-    push noblock            ; Push to FIFO (noblock to avoid stalling)
-    
-    ; Leave pin in high-Z / input mode (already set)
-    ; The pin will remain in input mode, ready for next cycle
-    
-.wrap                       ; Loop back to start
+.wrap_target
+; this gets us a one-hot bitmask indicating which pin we're polling
+mov isr, osr
+
+; set the hot pin to output and pull it low
+mov pindirs, ???
+push block     ; send current value back to program (RX FIFO)
+out NULL, 1    ; shift left 1 bit
+mov y, osr
+jmp !y setup
+.wrap          ; Loop back to start
 
 % c-sdk {
 static inline void capacitive_touch_program_init(PIO pio, uint sm, uint offset, uint pin) {
@@ -62,15 +63,17 @@ static inline void capacitive_touch_program_init(PIO pio, uint sm, uint offset, 
     sm_config_set_in_shift(&c, false, false, 32);
     sm_config_set_out_shift(&c, false, false, 32);
     
-    // Disable internal pulls BEFORE initializing PIO control - we have an external pull-up
+    // Disable internal pulls before initializing PIO control - we have an external pull-up
     gpio_set_pulls(pin, false, false);
     
     // Set the pin to input mode initially (high-Z) and give control to PIO
     pio_gpio_init(pio, pin);
     pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
     
-    // Initialize and start the state machine
+    // Initialize the state machine
     pio_sm_init(pio, sm, offset, &c);
+
+    // Start running
     pio_sm_set_enabled(pio, sm, true);
 }
 %}
