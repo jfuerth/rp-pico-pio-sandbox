@@ -25,7 +25,8 @@
     ; Initialize counter - start at max and count down
     ; CPU will calculate: actual_count = 0xFFFFFFFF - reading
     mov x, ~NULL            ; x = 0xFFFFFFFF
-    
+    ;set x, 0x1f ; short timeout for debugging
+
 test_pin:
     jmp pin count_done      ; If pin is high, we're done counting
     jmp x-- test_pin        ; Otherwise continue counting
@@ -38,5 +39,5 @@ count_done:
     ; Leave pin in high-Z / input mode (already set)
     ; The pin will remain in input mode, ready for next cycle
 
-wait_for_restart:
-    jmp wait_for_restart
+PUBLIC wait_for_restart:
+    jmp wait_for_restart // TODO could take 4 consecutive readings before blocking (fill rx fifo) then raise an IRQ (blocking on it) to get the DMA involved
