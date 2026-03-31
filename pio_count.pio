@@ -1,0 +1,17 @@
+; Simple PIO program for testing: pull a value, decrement it, push it back
+;
+; This program pulls a value from the TX FIFO (blocks until data available),
+; decrements it, and pushes the result to the RX FIFO.
+
+.program pio_count
+
+loop:
+    pull block          ; Pull value from TX FIFO into OSR, block until available
+    mov x, osr          ; Move the value from OSR to x register
+    jmp x-- push_val    ; Decrement x; if result is non-zero, jump to push_val
+    jmp loop            ; If x is now 0 (original value was 1), don't push, just loop
+
+push_val:
+    mov isr, x          ; Move decremented x to ISR (staging register for push)
+    push                ; Push to RX FIFO
+    jmp loop            ; Loop back to wait for next value

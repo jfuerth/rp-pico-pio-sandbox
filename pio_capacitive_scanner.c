@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include "pico/stdlib.h"
+#include "hardware/dma.h"
 #include "hardware/pio.h"
 #include "hardware/gpio.h"
 #include "hardware/clocks.h"
@@ -21,19 +22,6 @@ static void capacitive_touch_one_time_setup(PIO pio, uint first_pin, uint num_ke
     }
 }
 
-static inline void capacitive_touch_config_set_pin(pio_sm_config *c, PIO pio, uint sm, uint offset, uint pin) {
-    // Configure the pin for SET operations
-    sm_config_set_set_pins(c, pin, 1);
-    
-    // Configure the pin for JMP PIN test
-    sm_config_set_jmp_pin(c, pin);
-    
-    // set current pin direction to output so we can drive it low to discharge the sensor
-    // TODO: doesn't the PIO program do this too? is it needed here?
-    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
-}
-
-
 int main() {
     // Initialize stdio for printf
     stdio_init_all();
@@ -46,6 +34,7 @@ int main() {
     // Small delay to let serial connection stabilize
     sleep_ms(1000);
 
+    // =========== PIO SETUP ===========
     // Just grabbing PIO0 for now
     PIO pio = pio0;
     uint pio_program_offset = pio_add_program(pio, &capacitive_touch_program);
@@ -69,62 +58,114 @@ int main() {
     sm_config_set_in_shift(&c, false, false, 32);
     sm_config_set_out_shift(&c, false, false, 32);
 
-    pio_sm_config configs[NUM_KEYS];
+    uint32_t execctrls[NUM_KEYS + 1]; // +1 for the null at the end which stops the DMA chain
+    uint32_t pinctrls[NUM_KEYS];
     for (uint i = 0; i < NUM_KEYS; i++) {
-        configs[i] = c;
-        capacitive_touch_config_set_pin(&configs[i], pio, sm, pio_program_offset, FIRST_KEY_PIN + i);
+        uint pin = FIRST_KEY_PIN + i;
+        sm_config_set_set_pins(&c, pin, 1);
+        sm_config_set_jmp_pin(&c, pin);
+        
+        // set current pin direction to output so we can drive it low to discharge the sensor
+        // TODO: doesn't the PIO program do this too? is it needed here?
+        pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
+
+        execctrls[i] = c.execctrl;
+        pinctrls[i] = c.pinctrl;
     }
+    execctrls[NUM_KEYS] = 0; // null config at the end to stop the DMA chain after we've gone through all keys
     
     // Initialize the state machine with the first config, starting at wait_for_restart
-    pio_sm_init(pio, sm, pio_program_offset + capacitive_touch_offset_wait_for_restart, &configs[0]);
+    sm_config_set_set_pins(&c, FIRST_KEY_PIN, 1);
+    sm_config_set_jmp_pin(&c, FIRST_KEY_PIN);
+    pio_sm_init(pio, sm, pio_program_offset + capacitive_touch_offset_wait_for_restart, &c);
     
     // Start the state machine for the first time (it'll be in wait_for_restart, waiting for us to kick it off by writing to execctrl/pinctrl)
     pio_sm_set_enabled(pio, sm, true);
 
-    printf("\nStarting continuous scanning...\n\n");
+    // =========== DMA SETUP ===========
+
     
-    // Array to store readings
-    uint32_t readings[NUM_KEYS];
+    // DMA to store readings coming off the PIO
+    // (from the RX FIFO of the state machine, paced by the state machine's DREQ)
+    uint pio_rx_dma_chan = dma_claim_unused_channel(true);
+    static uint32_t readings[NUM_KEYS];
+
+    uint pio_execctrl_dma_chan = dma_claim_unused_channel(true); // execctrls -> pio->sm[sm].execctrl
+    uint pio_pinctrl_dma_chan = dma_claim_unused_channel(true);  // pinctrls -> pio->sm[sm].pinctrl
+    uint pio_restart_dma_chan = dma_claim_unused_channel(true);  // restart_jmp -> pio->sm[sm].instr (to kick off each measurement by jumping to the start of the program)
+
+    // Configure pio_rx_dma_chan
+    dma_channel_config dma_cfg = dma_channel_get_default_config(pio_rx_dma_chan);
+    channel_config_set_transfer_data_size(&dma_cfg, DMA_SIZE_32);
+    channel_config_set_read_increment(&dma_cfg, false);
+    channel_config_set_write_increment(&dma_cfg, true); // step to the next entry in the readings buffer after each transfer
+    channel_config_set_dreq(&dma_cfg, pio_get_dreq(pio, sm, false)); // wait on DREQ for the RX FIFO of our state machine
+    channel_config_set_chain_to(&dma_cfg, pio_execctrl_dma_chan); // chain to execctrl DMA channel for continuous transfers
+
+    // Configure pio_execctrl_dma_chan
+    dma_channel_config pio_execctrl_dma_cfg = dma_channel_get_default_config(pio_execctrl_dma_chan);
+    channel_config_set_transfer_data_size(&pio_execctrl_dma_cfg, DMA_SIZE_32);
+    channel_config_set_read_increment(&pio_execctrl_dma_cfg, true); // step through the execctrls array
+    channel_config_set_write_increment(&pio_execctrl_dma_cfg, false); // always write to the same place (execctrl register)
+    channel_config_set_chain_to(&pio_execctrl_dma_cfg, pio_pinctrl_dma_chan); // chain to pinctrl DMA channel after each transfer
+
+    // Configure pio_pinctrl_dma_chan
+    dma_channel_config pio_pinctrl_dma_cfg = dma_channel_get_default_config(pio_pinctrl_dma_chan);
+    channel_config_set_transfer_data_size(&pio_pinctrl_dma_cfg, DMA_SIZE_32);
+    channel_config_set_read_increment(&pio_pinctrl_dma_cfg, true); // step through the pinctrls array
+    channel_config_set_write_increment(&pio_pinctrl_dma_cfg, false); // always write to the same place (pinctrl register)
+    channel_config_set_chain_to(&pio_pinctrl_dma_cfg, pio_restart_dma_chan); // chain to restart DMA channel after each transfer
+
+    // Configure pio_restart_dma_chan
+    uint32_t restart_jmp = pio_encode_jmp(pio_program_offset); // the instruction we want to write to the instr register to kick off each measurement by jumping to the start of the program
+    dma_channel_config pio_restart_dma_cfg = dma_channel_get_default_config(pio_restart_dma_chan);
+    channel_config_set_transfer_data_size(&pio_restart_dma_cfg, DMA_SIZE_32);
+    channel_config_set_read_increment(&pio_restart_dma_cfg, false); // always read the same value (the restart_jmp instruction)
+    channel_config_set_write_increment(&pio_restart_dma_cfg, false); // always write to the same place (instr register)
+    channel_config_set_chain_to(&pio_restart_dma_cfg, pio_rx_dma_chan); // chain back to the first DMA channel to create a continuous loop
+
+    printf("\nStarting continuous scanning...\n\n");
     
     // Main loop: continuously read and display touch sensor values
     while (true) {
+
+        dma_channel_configure(pio_rx_dma_chan, &dma_cfg,
+                            readings, // write address
+                            &pio->rxf[sm], // read address (RX FIFO of our state machine)
+                            1, // transfer count (we need to update the PIO config for each key, so we'll do one transfer at a time)
+                            false); // don't start yet, we'll trigger manually
+        dma_channel_configure(pio_execctrl_dma_chan, &pio_execctrl_dma_cfg,
+                            &pio->sm[sm].execctrl, // write address (execctrl register of our state machine)
+                            execctrls, // read address (our array of execctrl values for each key)
+                            1, // transfer count (transfer one value per key measurement)
+                            false); // don't start yet; will be triggered by the pio_rx_dma_chan
+        dma_channel_configure(pio_pinctrl_dma_chan, &pio_pinctrl_dma_cfg,
+                            &pio->sm[sm].pinctrl, // write address (pinctrl register of our state machine)
+                            pinctrls, // read address (our array of pinctrl values for each key)
+                            1, // transfer count (transfer one value per key measurement)
+                            false); // don't start yet; will be triggered by the pio_execctrl_dma_chan
+        dma_channel_configure(pio_restart_dma_chan, &pio_restart_dma_cfg,
+                            &pio->sm[sm].instr, // write address (instr register of our state machine)
+                            &restart_jmp, // read address (the instruction to jump to the start of the program)
+                            1, // transfer count (just one instruction)
+                            false); // don't start yet; will be triggered by the pio_pinctrl_dma_chan
+
         // Read from all sensor FIFOs
-        for (uint i = 0; i < NUM_KEYS; i++) {
-            printf("\nReading key %d on pin %d...\n", i, FIRST_KEY_PIN + i);
+        dma_channel_start(pio_execctrl_dma_chan); // trigger the DMA transfer to read the result of this measurement when it's ready
+            
+        // Wait for data to be available in FIFO
+        printf("Waiting for data...");
+        dma_channel_wait_for_finish_blocking(pio_rx_dma_chan);            
+        printf("DMA completed. Reading values...\n");
 
-            // Write new config directly to registers (DMA-able operation!)
-            // The SM is safely stuck in wait_for_restart loop at this point
-            pio->sm[sm].execctrl = configs[i].execctrl;
-            pio->sm[sm].pinctrl = configs[i].pinctrl;
-            // Note: clkdiv and shiftctrl don't change between configs, so we skip them
-            
-            // Jump to start to begin the measurement
-            pio_sm_exec(pio, sm, pio_encode_jmp(pio_program_offset));
-            
-            printf("Waiting for data...");
-
-            // Wait for data to be available in FIFO
-            while (pio_sm_is_rx_fifo_empty(pio, sm)) {
-                tight_loop_contents();
-            }
-            
-            printf("Data available! Reading... ");
-            // Read the cycle count from FIFO
-            // PIO counts down from 0xFFFFFFFF, so actual count = MAX - reading
-            uint32_t countdown_value = pio_sm_get_blocking(pio, sm);
-            readings[i] = 0xFFFFFFFF - countdown_value;
-            printf("Done! Count: %lu\n", readings[i]);
-        }
-        
         // Print all readings on one line
         printf("Keys: ");
         for (uint i = 0; i < NUM_KEYS; i++) {
-            printf("K%d:%5lu  ", i, readings[i]);
+            printf("K%d:%5lu  ", i, 0xFFFFFFFF - readings[i]);
         }
         printf("\n");
         
         // Small delay to make output readable
-        // You can reduce or remove this for faster scanning
         sleep_ms(100);
     }
     

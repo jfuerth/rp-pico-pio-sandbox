@@ -28,6 +28,7 @@ pico_generate_pio_header(pio_capacitive_scanner ${CMAKE_CURRENT_LIST_DIR}/capaci
 target_link_libraries(pio_capacitive_scanner 
     pico_stdlib
     hardware_pio
+    hardware_dma
 )
 
 # enable usb output, disable uart output
@@ -36,3 +37,35 @@ pico_enable_stdio_uart(pio_capacitive_scanner 0)
 
 # create map/bin/hex/uf2 file in addition to ELF.
 pico_add_extra_outputs(pio_capacitive_scanner)
+
+# Test executable for DMA chaining with simpler setup
+add_executable(pio_dma_chain_test
+    pio_dma_chain_test.c
+)
+
+# Generate PIO header from .pio file
+pico_generate_pio_header(pio_dma_chain_test ${CMAKE_CURRENT_LIST_DIR}/pio_count.pio)
+
+target_link_libraries(pio_dma_chain_test 
+    pico_stdlib
+    hardware_pio
+    hardware_dma
+)
+
+pico_enable_stdio_usb(pio_dma_chain_test 1)
+pico_enable_stdio_uart(pio_dma_chain_test 0)
+pico_add_extra_outputs(pio_dma_chain_test)
+
+# Simple test to verify DMA chaining reload behavior
+add_executable(dma_chain_reload_test
+    dma_chain_reload_test.c
+)
+
+target_link_libraries(dma_chain_reload_test 
+    pico_stdlib
+    hardware_dma
+)
+
+pico_enable_stdio_usb(dma_chain_reload_test 1)
+pico_enable_stdio_uart(dma_chain_reload_test 0)
+pico_add_extra_outputs(dma_chain_reload_test)
