@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include "pico/stdlib.h"
 #include "hardware/dma.h"
 #include "hardware/pio.h"
@@ -10,6 +11,14 @@
 #define NUM_KEYS 4
 #define FIRST_KEY_PIN 0
 
+// DMA control block structure
+typedef struct {
+    void* read_addr;
+    void* write_addr;
+    uint32_t transfer_count;
+    uint32_t ctrl;  // The DMA control register value
+} dma_control_block_t;
+
 static void capacitive_touch_one_time_setup(PIO pio, uint first_pin, uint num_keys, uint pio_program_offset) {
     // Set up all pins:
     //  - Disable pull-up/pull-down 
@@ -20,6 +29,128 @@ static void capacitive_touch_one_time_setup(PIO pio, uint first_pin, uint num_ke
         gpio_set_pulls(pin, false, false);  // Disable internal pulls (relying on external pull-up)
         pio_gpio_init(pio, pin);
     }
+}
+
+// Set up DMA control blocks for capacitive touch scanning
+// Returns pointer to control blocks array (allocated on heap)
+// For each key, we need to:
+//   1. Write execctrl register
+//   2. Write pinctrl register  
+//   3. Write restart instruction to kick off measurement
+//   4. Read result from RX FIFO
+static dma_control_block_t* setup_capacitive_scanner_dma(
+    uint dma_worker_chan,
+    uint dma_control_chan,
+    PIO pio,
+    uint sm,
+    uint first_pin,
+    uint num_keys,
+    uint pio_program_offset,
+    uint32_t* execctrls,
+    uint32_t* pinctrls,
+    uint32_t* readings) {
+    
+    // We need 4 operations per key, plus 1 null control block to signal completion
+    uint num_control_blocks = num_keys * 4 + 1;
+    dma_control_block_t* control_blocks = malloc(num_control_blocks * sizeof(dma_control_block_t));
+    
+    if (!control_blocks) {
+        printf("ERROR: Failed to allocate control blocks!\n");
+        return NULL;
+    }
+    
+    // Prepare the restart instruction (jump to start of program)
+    static uint32_t restart_jmp;
+    restart_jmp = pio_encode_jmp(pio_program_offset);
+    
+    // Get worker DMA register base address
+    volatile uint32_t* worker_regs = (volatile uint32_t*)&dma_hw->ch[dma_worker_chan];
+    
+    // Configure base channel configs for each operation type
+    // All operations chain to the control DMA
+    
+    // Config for writing PIO registers (execctrl, pinctrl, instr)
+    dma_channel_config pio_write_cfg = dma_channel_get_default_config(dma_worker_chan);
+    channel_config_set_transfer_data_size(&pio_write_cfg, DMA_SIZE_32);
+    channel_config_set_read_increment(&pio_write_cfg, false);
+    channel_config_set_write_increment(&pio_write_cfg, false);
+    channel_config_set_chain_to(&pio_write_cfg, dma_control_chan);
+    // Raise IRQ when 0 is written to trigger register (null control block)
+    channel_config_set_irq_quiet(&pio_write_cfg, true);
+    
+    // Config for reading from PIO RX FIFO (paced by DREQ)
+    dma_channel_config pio_read_cfg = dma_channel_get_default_config(dma_worker_chan);
+    channel_config_set_transfer_data_size(&pio_read_cfg, DMA_SIZE_32);
+    channel_config_set_read_increment(&pio_read_cfg, false);
+    channel_config_set_write_increment(&pio_read_cfg, false);
+    channel_config_set_dreq(&pio_read_cfg, pio_get_dreq(pio, sm, false));
+    channel_config_set_chain_to(&pio_read_cfg, dma_control_chan);
+    channel_config_set_irq_quiet(&pio_read_cfg, true);
+    
+    // The DMA peripheral has 4 registers, and they are aliased in 4 different arrangements.
+    // The last register in each arrangement is the "trigger" - when you write to it, it starts
+    // the transfer using the trigger values plus the then-current values of the other registers.
+
+    //                        +0x0       +0x4         +0x8         +0xC (Trigger)
+    // Alias 0 (no prefix):   READ_ADDR  WRITE_ADDR   TRANS_COUNT  CTRL
+    // Alias 1 (al1_ prefix): CTRL       READ_ADDR    WRITE_ADDR   TRANS_COUNT
+    // Alias 2 (al2_ prefix): CTRL       TRANS_COUNT  READ_ADDR    WRITE_ADDR
+    // Alias 3 (al3_ prefix): CTRL       WRITE_ADDR   TRANS_COUNT  READ_ADDR
+
+    // Build control blocks for each key
+    for (uint i = 0; i < num_keys; i++) {
+        uint block_base = i * 4;
+        
+        // 1. Write execctrl register
+        control_blocks[block_base + 0].read_addr = &execctrls[i];
+        control_blocks[block_base + 0].write_addr = (void*)&pio->sm[sm].execctrl;
+        control_blocks[block_base + 0].transfer_count = 1;
+        control_blocks[block_base + 0].ctrl = pio_write_cfg.ctrl;
+        
+        // 2. Write pinctrl register
+        control_blocks[block_base + 1].read_addr = &pinctrls[i];
+        control_blocks[block_base + 1].write_addr = (void*)&pio->sm[sm].pinctrl;
+        control_blocks[block_base + 1].transfer_count = 1;
+        control_blocks[block_base + 1].ctrl = pio_write_cfg.ctrl;
+        
+        // 3. Write restart instruction to kick off measurement
+        control_blocks[block_base + 2].read_addr = &restart_jmp;
+        control_blocks[block_base + 2].write_addr = (void*)&pio->sm[sm].instr;
+        control_blocks[block_base + 2].transfer_count = 1;
+        control_blocks[block_base + 2].ctrl = pio_write_cfg.ctrl;
+        
+        // 4. Read result from RX FIFO (paced by PIO)
+        control_blocks[block_base + 3].read_addr = (void*)&pio->rxf[sm];
+        control_blocks[block_base + 3].write_addr = &readings[i];
+        control_blocks[block_base + 3].transfer_count = 1;
+        control_blocks[block_base + 3].ctrl = pio_read_cfg.ctrl;
+    }
+    
+    // Add a null control block at the end to signal completion via IRQ
+    // When transfer_count is 0, it triggers the IRQ flag
+    control_blocks[num_keys * 4].read_addr = NULL;
+    control_blocks[num_keys * 4].write_addr = NULL;
+    control_blocks[num_keys * 4].transfer_count = 0;
+    control_blocks[num_keys * 4].ctrl = 0;  // null trigger ends the chain and raises IRQ
+    
+    // Configure control DMA to write control blocks to worker DMA registers
+    dma_channel_config control_cfg = dma_channel_get_default_config(dma_control_chan);
+    channel_config_set_transfer_data_size(&control_cfg, DMA_SIZE_32);
+    channel_config_set_read_increment(&control_cfg, true);   // Step through control blocks
+    channel_config_set_write_increment(&control_cfg, true);  // Step through worker registers
+    channel_config_set_ring(&control_cfg, true, 4);          // Ring on write: 16 bytes = 4 registers
+    
+    dma_channel_configure(dma_control_chan, &control_cfg,
+                         worker_regs,           // Write to worker DMA registers
+                         control_blocks,        // Read from control blocks
+                         4,                     // Transfer 4 words (1 control block), auto-reloads on chain
+                         false);                // Don't start yet
+    
+    printf("Created %u control blocks for %u keys\n", num_control_blocks, num_keys);
+    printf("  Control DMA chan %u: writes control blocks to worker DMA\n", dma_control_chan);
+    printf("  Worker DMA chan %u: executes scripted operations\n", dma_worker_chan);
+    
+    return control_blocks;
 }
 
 int main() {
@@ -83,81 +214,54 @@ int main() {
     pio_sm_set_enabled(pio, sm, true);
 
     // =========== DMA SETUP ===========
-
     
-    // DMA to store readings coming off the PIO
-    // (from the RX FIFO of the state machine, paced by the state machine's DREQ)
-    uint pio_rx_dma_chan = dma_claim_unused_channel(true);
+    // Allocate readings array
     static uint32_t readings[NUM_KEYS];
-
-    uint pio_execctrl_dma_chan = dma_claim_unused_channel(true); // execctrls -> pio->sm[sm].execctrl
-    uint pio_pinctrl_dma_chan = dma_claim_unused_channel(true);  // pinctrls -> pio->sm[sm].pinctrl
-    uint pio_restart_dma_chan = dma_claim_unused_channel(true);  // restart_jmp -> pio->sm[sm].instr (to kick off each measurement by jumping to the start of the program)
-
-    // Configure pio_rx_dma_chan
-    dma_channel_config dma_cfg = dma_channel_get_default_config(pio_rx_dma_chan);
-    channel_config_set_transfer_data_size(&dma_cfg, DMA_SIZE_32);
-    channel_config_set_read_increment(&dma_cfg, false);
-    channel_config_set_write_increment(&dma_cfg, true); // step to the next entry in the readings buffer after each transfer
-    channel_config_set_dreq(&dma_cfg, pio_get_dreq(pio, sm, false)); // wait on DREQ for the RX FIFO of our state machine
-    channel_config_set_chain_to(&dma_cfg, pio_execctrl_dma_chan); // chain to execctrl DMA channel for continuous transfers
-
-    // Configure pio_execctrl_dma_chan
-    dma_channel_config pio_execctrl_dma_cfg = dma_channel_get_default_config(pio_execctrl_dma_chan);
-    channel_config_set_transfer_data_size(&pio_execctrl_dma_cfg, DMA_SIZE_32);
-    channel_config_set_read_increment(&pio_execctrl_dma_cfg, true); // step through the execctrls array
-    channel_config_set_write_increment(&pio_execctrl_dma_cfg, false); // always write to the same place (execctrl register)
-    channel_config_set_chain_to(&pio_execctrl_dma_cfg, pio_pinctrl_dma_chan); // chain to pinctrl DMA channel after each transfer
-
-    // Configure pio_pinctrl_dma_chan
-    dma_channel_config pio_pinctrl_dma_cfg = dma_channel_get_default_config(pio_pinctrl_dma_chan);
-    channel_config_set_transfer_data_size(&pio_pinctrl_dma_cfg, DMA_SIZE_32);
-    channel_config_set_read_increment(&pio_pinctrl_dma_cfg, true); // step through the pinctrls array
-    channel_config_set_write_increment(&pio_pinctrl_dma_cfg, false); // always write to the same place (pinctrl register)
-    channel_config_set_chain_to(&pio_pinctrl_dma_cfg, pio_restart_dma_chan); // chain to restart DMA channel after each transfer
-
-    // Configure pio_restart_dma_chan
-    uint32_t restart_jmp = pio_encode_jmp(pio_program_offset); // the instruction we want to write to the instr register to kick off each measurement by jumping to the start of the program
-    dma_channel_config pio_restart_dma_cfg = dma_channel_get_default_config(pio_restart_dma_chan);
-    channel_config_set_transfer_data_size(&pio_restart_dma_cfg, DMA_SIZE_32);
-    channel_config_set_read_increment(&pio_restart_dma_cfg, false); // always read the same value (the restart_jmp instruction)
-    channel_config_set_write_increment(&pio_restart_dma_cfg, false); // always write to the same place (instr register)
-    channel_config_set_chain_to(&pio_restart_dma_cfg, pio_rx_dma_chan); // chain back to the first DMA channel to create a continuous loop
-
+    
+    // Claim DMA channels - only need 2 with control block approach!
+    uint dma_worker_chan = dma_claim_unused_channel(true);
+    uint dma_control_chan = dma_claim_unused_channel(true);
+    
+    printf("Using worker DMA channel %u\n", dma_worker_chan);
+    printf("Using control DMA channel %u\n\n", dma_control_chan);
+    
+    // Build control blocks for the complete scan sequence
+    dma_control_block_t* control_blocks = setup_capacitive_scanner_dma(
+        dma_worker_chan,
+        dma_control_chan,
+        pio,
+        sm,
+        FIRST_KEY_PIN,
+        NUM_KEYS,
+        pio_program_offset,
+        execctrls,
+        pinctrls,
+        readings);
+    
+    if (!control_blocks) {
+        printf("Failed to set up DMA!\n");
+        return 1;
+    }
+    
     printf("\nStarting continuous scanning...\n\n");
     
-    // Main loop: continuously read and display touch sensor values
+    // Main loop: continuously scan and display touch sensor values
     while (true) {
-
-        dma_channel_configure(pio_rx_dma_chan, &dma_cfg,
-                            readings, // write address
-                            &pio->rxf[sm], // read address (RX FIFO of our state machine)
-                            1, // transfer count (we need to update the PIO config for each key, so we'll do one transfer at a time)
-                            false); // don't start yet, we'll trigger manually
-        dma_channel_configure(pio_execctrl_dma_chan, &pio_execctrl_dma_cfg,
-                            &pio->sm[sm].execctrl, // write address (execctrl register of our state machine)
-                            execctrls, // read address (our array of execctrl values for each key)
-                            1, // transfer count (transfer one value per key measurement)
-                            false); // don't start yet; will be triggered by the pio_rx_dma_chan
-        dma_channel_configure(pio_pinctrl_dma_chan, &pio_pinctrl_dma_cfg,
-                            &pio->sm[sm].pinctrl, // write address (pinctrl register of our state machine)
-                            pinctrls, // read address (our array of pinctrl values for each key)
-                            1, // transfer count (transfer one value per key measurement)
-                            false); // don't start yet; will be triggered by the pio_execctrl_dma_chan
-        dma_channel_configure(pio_restart_dma_chan, &pio_restart_dma_cfg,
-                            &pio->sm[sm].instr, // write address (instr register of our state machine)
-                            &restart_jmp, // read address (the instruction to jump to the start of the program)
-                            1, // transfer count (just one instruction)
-                            false); // don't start yet; will be triggered by the pio_pinctrl_dma_chan
-
-        // Read from all sensor FIFOs
-        dma_channel_start(pio_execctrl_dma_chan); // trigger the DMA transfer to read the result of this measurement when it's ready
-            
-        // Wait for data to be available in FIFO
-        printf("Waiting for data...");
-        dma_channel_wait_for_finish_blocking(pio_rx_dma_chan);            
-        printf("DMA completed. Reading values...\n");
-
+        // Start the control DMA to begin the scan sequence
+        dma_channel_start(dma_control_chan);
+        
+        // Wait for worker DMA to assert its IRQ flag when it hits the null control block
+        // This indicates the scan is complete
+        while (!(dma_hw->intr & (1u << dma_worker_chan))) {
+            tight_loop_contents();
+        }
+        
+        // Clear the IRQ flag
+        dma_hw->ints0 = 1u << dma_worker_chan;
+        
+        // Reset control DMA read address to start of array for next scan
+        dma_channel_set_read_addr(dma_control_chan, control_blocks, false);
+        
         // Print all readings on one line
         printf("Keys: ");
         for (uint i = 0; i < NUM_KEYS; i++) {
