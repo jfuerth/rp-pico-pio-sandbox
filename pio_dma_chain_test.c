@@ -27,14 +27,12 @@ int main() {
     
     printf("SM%d enabled\n", sm);
     
-    // Claim DMA channels
+    // Claim DMA channels - only need 2 now!
     uint dma_worker_chan = dma_claim_unused_channel(true);
     uint dma_control_chan = dma_claim_unused_channel(true);
-    uint dma_reload_chan = dma_claim_unused_channel(true);
     
     printf("Using worker DMA channel %u\n", dma_worker_chan);
-    printf("Using control DMA channel %u\n", dma_control_chan);
-    printf("Using reload DMA channel %u\n\n", dma_reload_chan);
+    printf("Using control DMA channel %u\n\n", dma_control_chan);
     
     // Data arrays
     static uint32_t values_to_send[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
@@ -57,20 +55,19 @@ int main() {
     static dma_control_block_t control_blocks[20];
     
     // Configure the control register values for TX and RX operations
-    // Both will chain to reload DMA (not control) so reload→control happens after worker finishes
+    // Both will chain directly to control DMA (which will auto-reload its count=4)
     dma_channel_config tx_cfg = dma_channel_get_default_config(dma_worker_chan);
     channel_config_set_transfer_data_size(&tx_cfg, DMA_SIZE_32);
     channel_config_set_read_increment(&tx_cfg, false);   // Don't increment - control block will set address
     channel_config_set_write_increment(&tx_cfg, false);  // Don't increment - always write to TX FIFO
-    //channel_config_set_dreq(&tx_cfg, DREQ_FORCE);        // No pacing for TX
-    channel_config_set_chain_to(&tx_cfg, dma_reload_chan);  // Chain to reload DMA
+    channel_config_set_chain_to(&tx_cfg, dma_control_chan);  // Chain directly to control DMA
     
     dma_channel_config rx_cfg = dma_channel_get_default_config(dma_worker_chan);
     channel_config_set_transfer_data_size(&rx_cfg, DMA_SIZE_32);
     channel_config_set_read_increment(&rx_cfg, false);   // Always read from RX FIFO
     channel_config_set_write_increment(&rx_cfg, false);  // Don't increment - control block will set address
     channel_config_set_dreq(&rx_cfg, pio_get_dreq(pio, sm, false));  // Pace on PIO RX FIFO
-    channel_config_set_chain_to(&rx_cfg, dma_reload_chan);  // Chain to reload DMA
+    channel_config_set_chain_to(&rx_cfg, dma_control_chan);  // Chain directly to control DMA
     
     // Build control blocks: TX then RX for each value
     for (int i = 0; i < 10; i++) {
@@ -132,43 +129,21 @@ int main() {
                          4,                     // Transfer 4 registers (1 control block at a time)
                          false);                // Don't start yet
     
-    // Configure reload DMA to reset control DMA's transfer count back to 4
-    // It does 1 reload per trigger, gets triggered 20 times by the worker
-    static const uint32_t transfer_count_value = 4;
-    
-    dma_channel_config reload_cfg = dma_channel_get_default_config(dma_reload_chan);
-    channel_config_set_transfer_data_size(&reload_cfg, DMA_SIZE_32);
-    channel_config_set_read_increment(&reload_cfg, false);   // Always read same value (4)
-    channel_config_set_write_increment(&reload_cfg, false);  // Always write to control DMA's count register
-    // no chain because we write to the control channel's trigger register
-    
-    dma_channel_configure(dma_reload_chan, &reload_cfg,
-                         &dma_hw->ch[dma_control_chan].al1_transfer_count_trig,  // Write to control's transfer count trigger register
-                         &transfer_count_value,                          // Read from our constant
-                         1,                                              // Do 1 reload per trigger
-                         false);                                         // Don't start yet
-    
-    printf("Reload DMA config:\n");
-    printf("  Write to: 0x%08lx (control's al1_transfer_count_trig)\n", 
-           (uint32_t)&dma_hw->ch[dma_control_chan].al1_transfer_count_trig);
-    printf("  Read from: 0x%08lx (value=%lu)\n", (uint32_t)&transfer_count_value, transfer_count_value);
-    printf("  Count: 20\n");
-    printf("  Actual reload chan count after config: %lu\n", dma_hw->ch[dma_reload_chan].transfer_count);
-    printf("\n");
-    
-    printf("Starting control DMA to orchestrate worker DMA...\n\n");
-    
-    dma_channel_start(dma_control_chan);
+    printf("2-DMA setup complete:\n");
+    printf("  Control DMA: writes control blocks (count=4, auto-reloads on chain trigger)\n");
+    printf("  Worker DMA: executes operations (count=1, chains back to control)\n");
+    printf("\nStarting control DMA to orchestrate worker DMA...\n\n");
     
     // Monitor for some time with detailed stats every 1ms
     printf("Monitoring DMA and PIO state:\n");
-    printf("Time | Ctrl Count | Worker Count | Reload Count | RX FIFO Level | TX FIFO Level | Results\n");
-    printf("-----+------------+--------------+--------------+---------------+---------------+---------\n");
+    printf("Time | Ctrl Count | Worker Count | RX FIFO Level | TX FIFO Level | Results\n");
+    printf("-----+------------+--------------+---------------+---------------+---------\n");
+
+    dma_channel_start(dma_control_chan);
     
     for (int i = 0; i < 10; i++) {
         uint32_t ctrl_count = dma_hw->ch[dma_control_chan].transfer_count;
         uint32_t worker_count = dma_hw->ch[dma_worker_chan].transfer_count;
-        uint32_t reload_count = dma_hw->ch[dma_reload_chan].transfer_count;
         
         // Get PIO FIFO levels
         uint32_t rxf_level = pio_sm_get_rx_fifo_level(pio, sm);
@@ -180,19 +155,17 @@ int main() {
             if (results[j] != 99) filled++;
         }
         
-        printf("%2dms | %10lu | %12lu | %12lu | %13lu | %13lu | %d/10\n",
-               i, ctrl_count, worker_count, reload_count, rxf_level, txf_level, filled);
+        printf("%4d | %10lu | %12lu | %13lu | %13lu | %d/10\n",
+               i, ctrl_count, worker_count, rxf_level, txf_level, filled);
         
         // On first iteration, also show worker DMA registers after control DMA ran
         if (i == 0) {
             printf("     | Worker regs: READ=0x%08lx WRITE=0x%08lx COUNT=%lu CTRL=0x%08lx\n",
                    worker_regs[0], worker_regs[1], worker_regs[2], worker_regs[3]);
         }
-        
-        sleep_ms(1);
     }
     
-    printf("\nAfter 10ms:\n");
+    printf("\nAfter 10 observations:\n");
     
     printf("Final results: ");
     for (int i = 0; i < 10; i++) {
