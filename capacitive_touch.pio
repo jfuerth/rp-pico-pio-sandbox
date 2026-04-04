@@ -8,9 +8,6 @@
 ; When a finger touches the electrode, capacitance increases, which
 ; increases the charging time and thus the cycle count.
 ;
-; Clock divider should be set to achieve ~1 MHz (1 cycle = 1 us)
-; For 125 MHz system clock, use divider of 125
-;
 
 .program capacitive_touch
 
@@ -21,13 +18,13 @@
     mov x, ~NULL            ; x = 0xFFFFFFFF
     ;set x, 0x1f ; short timeout for debugging
 
-    set y, 4                ; Will read the pin 4 times, accumulating the results in x
+    set y, 8                ; Number of times to sample the pin, accumulating the results in x
 
 read_key:
     ; Pull the pin low to discharge the capacitor, then wait 10 us
     set pindirs, 1          ; Set pin to output mode
-    set pins, 0 [9]         ; Drive pin low and delay 9 cycles (total 10 us)
-
+    set pins, 0 [15]        ; Drive pin low and delay until discharged
+    
     ; Now switch pin to input mode and count cycles until it reads high
     set pindirs, 0          ; Set pin to input mode
     set pins, 1             ; Set output register to 1 (for proper high-Z behavior)

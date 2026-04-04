@@ -21,12 +21,12 @@ typedef struct {
 
 static void capacitive_touch_one_time_setup(PIO pio, uint first_pin, uint num_keys, uint pio_program_offset) {
     // Set up all pins:
-    //  - Disable pull-up/pull-down 
+    //  - Enable internal pull-up resistor
     //  - attach to PIO
     //  - set to input mode (high-Z) so they don't interfere with each other when we're not scanning them
     for (uint i = 0; i < num_keys; i++) {
         uint pin = first_pin + i;
-        gpio_set_pulls(pin, false, false);  // Disable internal pulls (relying on external pull-up)
+        gpio_set_pulls(pin, true, false);  // Enable internal pull-up, disable pull-down
         pio_gpio_init(pio, pin);
     }
 }
@@ -197,7 +197,12 @@ int main() {
     
     // Initialize the state machine starting at wait_for_restart
     pio_sm_config c = capacitive_touch_program_get_default_config(pio_program_offset);
-    sm_config_set_clkdiv(&c, 125.0f);  // Set clock divider for ~1 MHz (1 us per cycle)
+
+    // PIO clock divider is tuned to:
+    // - key capacitance
+    // - pull-up strength (internal pull-up in this case)
+    // - delay cycles during the pull-down-to-0v in the PIO program (need to fully discharge the pin)
+    sm_config_set_clkdiv(&c, 5.0f);
     sm_config_set_set_pins(&c, FIRST_KEY_PIN, 1);
     sm_config_set_jmp_pin(&c, FIRST_KEY_PIN);
     pio_sm_init(pio, sm, pio_program_offset + capacitive_touch_offset_wait_for_restart, &c);
