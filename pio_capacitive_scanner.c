@@ -5,6 +5,7 @@
 #include "hardware/pio.h"
 #include "hardware/gpio.h"
 #include "hardware/clocks.h"
+#include "hardware/structs/padsbank0.h"
 #include "capacitive_touch.pio.h"
 
 // Configuration
@@ -21,12 +22,12 @@ typedef struct {
 
 static void capacitive_touch_one_time_setup(PIO pio, uint first_pin, uint num_keys, uint pio_program_offset) {
     // Set up all pins:
-    //  - Enable internal pull-up resistor
+    //  - Disable pull-up/pull-down (will be enabled dynamically during scan)
     //  - attach to PIO
     //  - set to input mode (high-Z) so they don't interfere with each other when we're not scanning them
     for (uint i = 0; i < num_keys; i++) {
         uint pin = first_pin + i;
-        gpio_set_pulls(pin, true, false);  // Enable internal pull-up, disable pull-down
+        gpio_set_pulls(pin, false, false);  // Disable internal pulls initially
         pio_gpio_init(pio, pin);
     }
 }
@@ -35,10 +36,12 @@ static void capacitive_touch_one_time_setup(PIO pio, uint first_pin, uint num_ke
 //
 // Returns pointer to control blocks array (allocated on heap)
 // For each key, we need to:
-//   1. Write execctrl register
-//   2. Write pinctrl register  
-//   3. Write restart instruction to kick off measurement
-//   4. Read result from RX FIFO
+//   1. Disable pull-up on previous key
+//   2. Enable pull-up on current key
+//   3. Write execctrl register
+//   4. Write pinctrl register  
+//   5. Write restart instruction to kick off measurement
+//   6. Read result from RX FIFO
 static dma_control_block_t* setup_capacitive_scanner_dma(
     uint dma_worker_chan,
     uint dma_control_chan,
@@ -49,8 +52,8 @@ static dma_control_block_t* setup_capacitive_scanner_dma(
     uint pio_program_offset,
     uint32_t* readings) {
     
-    // We need 4 operations per key, plus 1 null control block to signal completion
-    uint num_control_blocks = num_keys * 4 + 1;
+    // We need 6 operations per key (2 GPIO + 2 PIO config + 1 restart + 1 read), plus 1 null control block to signal completion
+    uint num_control_blocks = num_keys * 6 + 1;
     dma_control_block_t* control_blocks = malloc(num_control_blocks * sizeof(dma_control_block_t));
     
     if (!control_blocks) {
@@ -62,6 +65,20 @@ static dma_control_block_t* setup_capacitive_scanner_dma(
     // These need to persist since control blocks reference them
     static uint32_t execctrls[NUM_KEYS];
     static uint32_t pinctrls[NUM_KEYS];
+    
+    // GPIO pad control register values for enabling/disabling pull-ups
+    // Bit 3 = PUE (Pull-Up Enable), Bit 2 = PDE (Pull-Down Enable)
+    // We keep other bits at their defaults (drive strength, slew rate, etc.)
+    static uint32_t pad_pullup_enabled[NUM_KEYS];
+    static uint32_t pad_pullup_disabled[NUM_KEYS];
+    
+    for (uint i = 0; i < num_keys; i++) {
+        uint pin = first_pin + i;
+        // Read current pad config and modify only pull-up/down bits
+        uint32_t base_config = padsbank0_hw->io[pin];
+        pad_pullup_enabled[i] = (base_config & ~(1u << 2)) | (1u << 3);  // Clear PDE, set PUE
+        pad_pullup_disabled[i] = base_config & ~((1u << 3) | (1u << 2)); // Clear both PUE and PDE
+    }
     
     // Build execctrl and pinctrl arrays for each key by configuring the 
     // settings that vary per key (which pin to use)
@@ -117,39 +134,53 @@ static dma_control_block_t* setup_capacitive_scanner_dma(
 
     // Build control blocks for each key
     for (uint i = 0; i < num_keys; i++) {
-        uint block_base = i * 4;
+        uint block_base = i * 6;
+        uint current_pin = first_pin + i;
+        uint prev_pin = first_pin + ((i + num_keys - 1) % num_keys);  // Wrap around for first key
         
-        // 1. Write execctrl register
-        control_blocks[block_base + 0].read_addr = &execctrls[i];
-        control_blocks[block_base + 0].write_addr = (void*)&pio->sm[sm].execctrl;
+        // 1. Disable pull-up on previous key's pin
+        control_blocks[block_base + 0].read_addr = &pad_pullup_disabled[(i + num_keys - 1) % num_keys];
+        control_blocks[block_base + 0].write_addr = (void*)&padsbank0_hw->io[prev_pin];
         control_blocks[block_base + 0].transfer_count = 1;
         control_blocks[block_base + 0].ctrl = pio_write_cfg.ctrl;
         
-        // 2. Write pinctrl register
-        control_blocks[block_base + 1].read_addr = &pinctrls[i];
-        control_blocks[block_base + 1].write_addr = (void*)&pio->sm[sm].pinctrl;
+        // 2. Enable pull-up on current key's pin
+        control_blocks[block_base + 1].read_addr = &pad_pullup_enabled[i];
+        control_blocks[block_base + 1].write_addr = (void*)&padsbank0_hw->io[current_pin];
         control_blocks[block_base + 1].transfer_count = 1;
         control_blocks[block_base + 1].ctrl = pio_write_cfg.ctrl;
         
-        // 3. Write restart instruction to kick off measurement
-        control_blocks[block_base + 2].read_addr = &restart_jmp;
-        control_blocks[block_base + 2].write_addr = (void*)&pio->sm[sm].instr;
+        // 3. Write execctrl register
+        control_blocks[block_base + 2].read_addr = &execctrls[i];
+        control_blocks[block_base + 2].write_addr = (void*)&pio->sm[sm].execctrl;
         control_blocks[block_base + 2].transfer_count = 1;
         control_blocks[block_base + 2].ctrl = pio_write_cfg.ctrl;
         
-        // 4. Read result from RX FIFO (paced by PIO)
-        control_blocks[block_base + 3].read_addr = (void*)&pio->rxf[sm];
-        control_blocks[block_base + 3].write_addr = &readings[i];
+        // 4. Write pinctrl register
+        control_blocks[block_base + 3].read_addr = &pinctrls[i];
+        control_blocks[block_base + 3].write_addr = (void*)&pio->sm[sm].pinctrl;
         control_blocks[block_base + 3].transfer_count = 1;
-        control_blocks[block_base + 3].ctrl = pio_read_cfg.ctrl;
+        control_blocks[block_base + 3].ctrl = pio_write_cfg.ctrl;
+        
+        // 5. Write restart instruction to kick off measurement
+        control_blocks[block_base + 4].read_addr = &restart_jmp;
+        control_blocks[block_base + 4].write_addr = (void*)&pio->sm[sm].instr;
+        control_blocks[block_base + 4].transfer_count = 1;
+        control_blocks[block_base + 4].ctrl = pio_write_cfg.ctrl;
+        
+        // 6. Read result from RX FIFO (paced by PIO)
+        control_blocks[block_base + 5].read_addr = (void*)&pio->rxf[sm];
+        control_blocks[block_base + 5].write_addr = &readings[i];
+        control_blocks[block_base + 5].transfer_count = 1;
+        control_blocks[block_base + 5].ctrl = pio_read_cfg.ctrl;
     }
     
     // Add a null control block at the end to signal completion via IRQ
     // When transfer_count is 0, it triggers the IRQ flag
-    control_blocks[num_keys * 4].read_addr = NULL;
-    control_blocks[num_keys * 4].write_addr = NULL;
-    control_blocks[num_keys * 4].transfer_count = 0;
-    control_blocks[num_keys * 4].ctrl = 0;  // null trigger ends the chain and raises IRQ
+    control_blocks[num_keys * 6].read_addr = NULL;
+    control_blocks[num_keys * 6].write_addr = NULL;
+    control_blocks[num_keys * 6].transfer_count = 0;
+    control_blocks[num_keys * 6].ctrl = 0;  // null trigger ends the chain and raises IRQ
     
     // Configure control DMA to write control blocks to worker DMA registers
     dma_channel_config control_cfg = dma_channel_get_default_config(dma_control_chan);
