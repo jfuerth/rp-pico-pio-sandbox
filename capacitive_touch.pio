@@ -14,6 +14,8 @@
 
 .program capacitive_touch
 
+.side_set 0 opt  ; Explicitly declare we're not using side-set pins (allows full 5-bit delay)
+
     ; Initialize counter - start at max and count down
     ; CPU will calculate: actual_count = 0xFFFFFFFF - reading
     mov x, ~NULL            ; x = 0xFFFFFFFF
@@ -25,7 +27,7 @@ read_key:
     ; Pull the pin low to discharge the capacitor, then wait 10 us
     set pindirs, 1          ; Set pin to output mode
     set pins, 0 [9]         ; Drive pin low and delay 9 cycles (total 10 us)
-    
+
     ; Now switch pin to input mode and count cycles until it reads high
     set pindirs, 0          ; Set pin to input mode
     set pins, 1             ; Set output register to 1 (for proper high-Z behavior)

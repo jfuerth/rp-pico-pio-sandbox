@@ -2,16 +2,24 @@ cmake_minimum_required(VERSION 3.13)
 
 # initialize pico-sdk from GIT
 # (note this can come from environment, CMake cache etc)
-set(PICO_SDK_FETCH_FROM_GIT on)
+# set(PICO_SDK_FETCH_FROM_GIT on)
+
+# Use a local SDK path instead of fetching from git
+# Option 1: Set path directly (update this path to your local SDK)
+# set(PICO_SDK_PATH "/path/to/your/pico-sdk")
+
+# Option 2: Use the already-fetched SDK in build directory
+set(PICO_SDK_PATH "$ENV{HOME}/prg/3rdparty/pico-sdk")
+
+# The list of boards will be in build/_deps/pico_sdk-src/src/boards/include/boards/ once you run cmake and it downloads the SDK
+#set(PICO_BOARD waveshare_rp2040_zero)
+set(PICO_BOARD waveshare_rp2350_tiny) # not exactly Waveshare Core2350B but close enough?
 
 # pico_sdk_import.cmake is a single file copied from this SDK
 # note: this must happen before project()
 include(pico_sdk_import.cmake)
 
 project(my_project)
-
-# The list of boards will be in build/_deps/pico_sdk-src/src/boards/include/boards/ once you run cmake and it downloads the SDK
-set(PICO_BOARD waveshare_rp2040_zero)
 
 # initialize the Raspberry Pi Pico SDK
 pico_sdk_init()

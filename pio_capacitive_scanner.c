@@ -31,7 +31,8 @@ static void capacitive_touch_one_time_setup(PIO pio, uint first_pin, uint num_ke
     }
 }
 
-// Set up DMA control blocks for capacitive touch scanning
+// Set up DMA control blocks for capacitive touch scanning.
+//
 // Returns pointer to control blocks array (allocated on heap)
 // For each key, we need to:
 //   1. Write execctrl register
@@ -46,8 +47,6 @@ static dma_control_block_t* setup_capacitive_scanner_dma(
     uint first_pin,
     uint num_keys,
     uint pio_program_offset,
-    uint32_t* execctrls,
-    uint32_t* pinctrls,
     uint32_t* readings) {
     
     // We need 4 operations per key, plus 1 null control block to signal completion
@@ -57,6 +56,25 @@ static dma_control_block_t* setup_capacitive_scanner_dma(
     if (!control_blocks) {
         printf("ERROR: Failed to allocate control blocks!\n");
         return NULL;
+    }
+    
+    // Build execctrl and pinctrl arrays for each key
+    // These need to persist since control blocks reference them
+    static uint32_t execctrls[NUM_KEYS];
+    static uint32_t pinctrls[NUM_KEYS];
+    
+    // Build execctrl and pinctrl arrays for each key by configuring the 
+    // settings that vary per key (which pin to use)
+    // Note: clkdiv and shift settings are configured in main() when the SM is initialized
+    pio_sm_config c = capacitive_touch_program_get_default_config(pio_program_offset);
+    
+    for (uint i = 0; i < num_keys; i++) {
+        uint pin = first_pin + i;
+        sm_config_set_set_pins(&c, pin, 1);
+        sm_config_set_jmp_pin(&c, pin);
+        
+        execctrls[i] = c.execctrl;
+        pinctrls[i] = c.pinctrl;
     }
     
     // Prepare the restart instruction (jump to start of program)
@@ -177,40 +195,17 @@ int main() {
 
     capacitive_touch_one_time_setup(pio, FIRST_KEY_PIN, NUM_KEYS, pio_program_offset);
     
-    // Create an array of control structures for each key, so we can switch keys using DMA
-    // The default settings for the PIO state machine (independent of which pin is 'hot')
+    // Initialize the state machine starting at wait_for_restart
     pio_sm_config c = capacitive_touch_program_get_default_config(pio_program_offset);
-
-    // Set clock divider to ~1 MHz (125 MHz / 125 = 1 MHz)
-    // This makes each PIO cycle = 1 microsecond
-    sm_config_set_clkdiv(&c, 125.0f);
-    
-    // Configure autopush: we're using manual push, so disable autopush
-    sm_config_set_in_shift(&c, false, false, 32);
-    sm_config_set_out_shift(&c, false, false, 32);
-
-    uint32_t execctrls[NUM_KEYS + 1]; // +1 for the null at the end which stops the DMA chain
-    uint32_t pinctrls[NUM_KEYS];
-    for (uint i = 0; i < NUM_KEYS; i++) {
-        uint pin = FIRST_KEY_PIN + i;
-        sm_config_set_set_pins(&c, pin, 1);
-        sm_config_set_jmp_pin(&c, pin);
-        
-        // set current pin direction to output so we can drive it low to discharge the sensor
-        // TODO: doesn't the PIO program do this too? is it needed here?
-        pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
-
-        execctrls[i] = c.execctrl;
-        pinctrls[i] = c.pinctrl;
-    }
-    execctrls[NUM_KEYS] = 0; // null config at the end to stop the DMA chain after we've gone through all keys
-    
-    // Initialize the state machine with the first config, starting at wait_for_restart
+    sm_config_set_clkdiv(&c, 125.0f);  // Set clock divider for ~1 MHz (1 us per cycle)
     sm_config_set_set_pins(&c, FIRST_KEY_PIN, 1);
     sm_config_set_jmp_pin(&c, FIRST_KEY_PIN);
     pio_sm_init(pio, sm, pio_program_offset + capacitive_touch_offset_wait_for_restart, &c);
     
-    // Start the state machine for the first time (it'll be in wait_for_restart, waiting for us to kick it off by writing to execctrl/pinctrl)
+    // Set pin direction for first key
+    pio_sm_set_consecutive_pindirs(pio, sm, FIRST_KEY_PIN, 1, false);
+    
+    // Start the state machine
     pio_sm_set_enabled(pio, sm, true);
 
     // =========== DMA SETUP ===========
@@ -234,8 +229,6 @@ int main() {
         FIRST_KEY_PIN,
         NUM_KEYS,
         pio_program_offset,
-        execctrls,
-        pinctrls,
         readings);
     
     if (!control_blocks) {
